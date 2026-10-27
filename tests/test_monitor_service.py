@@ -269,3 +269,86 @@ def test_recovery_action_success_does_not_resolve_unhealthy_service():
     incident = manager.list_incidents()[0]
     assert incident["status"] == "open"
     assert "resolved_at" not in incident
+
+def test_health_check_is_recorded_in_history():
+    from app.monitoring.history_store import MonitoringHistoryStore
+
+    manager = IncidentManager()
+    history = MonitoringHistoryStore()
+
+    service = MonitoredService(
+        name="demo-service",
+        url="http://example.invalid/health",
+        incident_manager=manager,
+        history_store=history,
+    )
+
+    healthy = {
+        "healthy": True,
+        "status_code": 200,
+        "response_time_ms": 25,
+        "error": None,
+    }
+
+    with patch(
+        "app.monitoring.monitor_service.check_http_health",
+        return_value=healthy,
+    ):
+        service.check_once()
+
+    records = history.get_history("demo-service")
+
+    assert len(records) == 1
+    assert records[0]["healthy"] is True
+    assert records[0]["status_code"] == 200
+    assert "timestamp" in records[0]
+
+
+def test_recovery_verification_is_also_recorded():
+    from unittest.mock import Mock
+    from app.monitoring.history_store import MonitoringHistoryStore
+
+    manager = IncidentManager()
+    history = MonitoringHistoryStore()
+
+    coordinator = Mock()
+    coordinator.attempt_recovery.return_value = {
+        "service": "demo-service",
+        "attempted": True,
+        "success": True,
+        "message": "Recovery action completed",
+    }
+
+    service = MonitoredService(
+        name="demo-service",
+        url="http://example.invalid/health",
+        incident_manager=manager,
+        failure_threshold=1,
+        recovery_coordinator=coordinator,
+        history_store=history,
+    )
+
+    failed = {
+        "healthy": False,
+        "status_code": None,
+        "response_time_ms": 100,
+        "error": "Simulated failure",
+    }
+    healthy = {
+        "healthy": True,
+        "status_code": 200,
+        "response_time_ms": 30,
+        "error": None,
+    }
+
+    with patch(
+        "app.monitoring.monitor_service.check_http_health",
+        side_effect=[failed, healthy],
+    ):
+        service.check_once()
+
+    records = history.get_history("demo-service")
+
+    assert len(records) == 2
+    assert records[0]["healthy"] is False
+    assert records[1]["healthy"] is True

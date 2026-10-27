@@ -1,5 +1,6 @@
 
 from app import create_app
+from unittest.mock import patch
 
 
 def test_home_endpoint():
@@ -132,3 +133,114 @@ def test_security_scans_endpoint():
         assert severity in findings
         assert isinstance(findings[severity], int)
         assert findings[severity] >= 0
+
+def test_monitoring_metrics_endpoint():
+    client = create_app().test_client()
+
+    response = client.get("/api/monitoring/metrics")
+
+    assert response.status_code == 200
+
+    data = response.get_json()
+
+    assert data["demo_data"] is False
+    assert data["metrics"]["total_checks"] == 0
+    assert data["metrics"]["healthy_checks"] == 0
+    assert data["metrics"]["unhealthy_checks"] == 0
+    assert data["metrics"]["success_rate_percent"] is None
+
+
+def test_monitoring_metrics_endpoint_returns_recorded_data():
+    app = create_app()
+    client = app.test_client()
+
+    history_store = app.extensions["monitoring_history_store"]
+
+    history_store.record({
+        "service": "demo-api",
+        "healthy": True,
+        "status_code": 200,
+        "response_time_ms": 25.0,
+        "error": None,
+    })
+
+    history_store.record({
+        "service": "demo-api",
+        "healthy": False,
+        "status_code": 503,
+        "response_time_ms": 40.0,
+        "error": "Service unavailable",
+    })
+
+    response = client.get(
+        "/api/monitoring/metrics?service=demo-api"
+    )
+
+    assert response.status_code == 200
+
+    data = response.get_json()
+    metrics = data["metrics"]
+
+    assert data["demo_data"] is False
+    assert data["service"] == "demo-api"
+    assert metrics["total_checks"] == 2
+    assert metrics["healthy_checks"] == 1
+    assert metrics["unhealthy_checks"] == 1
+    assert metrics["success_rate_percent"] == 50.0
+    assert metrics["average_response_time_ms"] == 32.5
+
+
+def test_app_registers_monitor_runner_with_shared_history_store():
+    app = create_app()
+
+    runner = app.extensions["monitor_runner"]
+    history_store = app.extensions["monitoring_history_store"]
+
+    assert runner.is_running is False
+    assert len(runner.monitored_services) == 1
+    assert runner.monitored_services[0].name == "platform-api"
+    assert (
+        runner.monitored_services[0].history_store
+        is history_store
+    )
+
+
+from unittest.mock import patch
+
+
+def test_runner_health_check_appears_in_metrics_api():
+    app = create_app()
+    client = app.test_client()
+    runner = app.extensions["monitor_runner"]
+
+    healthy_result = {
+        "healthy": True,
+        "status_code": 200,
+        "response_time_ms": 18.0,
+        "error": None,
+    }
+
+    with patch(
+        "app.monitoring.monitor_service.check_http_health",
+        return_value=healthy_result,
+    ):
+        results = runner.run_once()
+
+    assert results[0]["service"] == "platform-api"
+    assert results[0]["health"]["healthy"] is True
+    assert results[0]["health"]["consecutive_failures"] == 0
+
+    response = client.get(
+        "/api/monitoring/metrics?service=platform-api"
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    metrics = data["metrics"]
+
+    assert data["demo_data"] is False
+    assert metrics["total_checks"] == 1
+    assert metrics["healthy_checks"] == 1
+    assert metrics["unhealthy_checks"] == 0
+    assert metrics["success_rate_percent"] == 100.0
+    assert metrics["average_response_time_ms"] == 18.0

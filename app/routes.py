@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, current_app, jsonify, request
 
 from app.demo_data import (
     DEMO_SERVICES,
@@ -127,4 +127,18 @@ def security_scans():
         "demo_data": True,
         "total": len(DEMO_SECURITY_SCANS),
         "scans": DEMO_SECURITY_SCANS
+    }), 200
+
+@main.route("/api/monitoring/metrics", methods=["GET"])
+def monitoring_metrics():
+    service_name = request.args.get("service")
+
+    metrics_service = current_app.extensions[
+        "monitoring_metrics_service"
+    ]
+
+    return jsonify({
+        "demo_data": False,
+        "service": service_name,
+        "metrics": metrics_service.get_metrics(service_name),
     }), 200

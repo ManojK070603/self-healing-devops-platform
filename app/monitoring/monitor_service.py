@@ -2,7 +2,7 @@ from app.monitoring.health_checker import (
     HealthMonitor,
     check_http_health,
 )
-
+from app.monitoring.history_store import MonitoringHistoryStore
 
 class MonitoredService:
     """Connect health checks, incidents, and controlled recovery."""
@@ -15,6 +15,7 @@ class MonitoredService:
         failure_threshold=3,
         timeout=3,
         recovery_coordinator=None,
+        history_store=None,
     ):
         self.name = name
         self.url = url
@@ -25,12 +26,18 @@ class MonitoredService:
         self.incident_manager = incident_manager
         self.recovery_coordinator = recovery_coordinator
         self.active_incident = None
+        self.history_store = history_store
 
     def check_once(self):
         health_result = check_http_health(
             self.url,
             timeout=self.timeout,
         )
+        if self.history_store is not None:
+            self.history_store.record({
+                "service": self.name,
+                **health_result,
+            })
 
         monitor_result = self.monitor.record_result(
             health_result
@@ -86,6 +93,12 @@ class MonitoredService:
                     )
 
                     health_result = recovery_verification
+
+                    if self.history_store is not None:
+                        self.history_store.record({
+                            "service": self.name,
+                            **recovery_verification,
+                        })
 
         if (
             health_result["healthy"]
