@@ -1,30 +1,60 @@
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.monitoring.incident_manager import IncidentManager
 from app.monitoring.monitor_service import MonitoredService
+from app.monitoring.history_store import MonitoringHistoryStore
+from app.recovery.recovery_coordinator import RecoveryCoordinator
+from app.recovery.recovery_policy import RecoveryPolicy
+
+
+def make_result(healthy, status_code=None, error="Simulated failure"):
+    return {
+        "healthy": healthy,
+        "status_code": status_code,
+        "response_time_ms": 50,
+        "error": None if healthy else error,
+    }
+
+
+def make_service(
+    manager=None,
+    failure_threshold=3,
+    coordinator=None,
+    history_store=None,
+    recovery_verification_attempts=5,
+):
+    return MonitoredService(
+        name="demo-service",
+        url="http://example.invalid/health",
+        incident_manager=manager or IncidentManager(),
+        failure_threshold=failure_threshold,
+        recovery_coordinator=coordinator,
+        history_store=history_store,
+        recovery_verification_attempts=recovery_verification_attempts,
+        recovery_verification_interval=0,
+    )
+
+
+def make_coordinator(attempted=True, success=True):
+    coordinator = Mock()
+    coordinator.attempt_recovery.return_value = {
+        "service": "demo-service",
+        "attempted": attempted,
+        "success": success,
+        "message": "Recovery action completed",
+    }
+    return coordinator
 
 
 def test_three_failures_create_one_incident():
     manager = IncidentManager()
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
-        failure_threshold=3,
-    )
-
-    failed_result = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 3000,
-        "error": "Simulated connection failure",
-    }
+    service = make_service(manager=manager, failure_threshold=3)
+    failed = make_result(False)
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        return_value=failed_result,
+        return_value=failed,
     ):
         first = service.check_once()
         second = service.check_once()
@@ -35,41 +65,20 @@ def test_three_failures_create_one_incident():
     assert second["incident_created"] is False
     assert third["incident_created"] is True
     assert fourth["incident_created"] is False
-
     assert len(manager.list_incidents()) == 1
     assert manager.list_incidents()[0]["service"] == "demo-service"
 
 
 def test_successful_check_resets_failure_count():
     manager = IncidentManager()
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
-        failure_threshold=3,
-    )
-
-    failed_result = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 3000,
-        "error": "Simulated connection failure",
-    }
-
-    healthy_result = {
-        "healthy": True,
-        "status_code": 200,
-        "response_time_ms": 100,
-        "error": None,
-    }
+    service = make_service(manager=manager, failure_threshold=3)
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
         side_effect=[
-            failed_result,
-            failed_result,
-            healthy_result,
+            make_result(False),
+            make_result(False),
+            make_result(True, 200),
         ],
     ):
         service.check_once()
@@ -81,36 +90,17 @@ def test_successful_check_resets_failure_count():
     assert result["incident_created"] is False
     assert manager.list_incidents() == []
 
+
 def test_recovery_resolves_existing_incident():
     manager = IncidentManager()
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
-        failure_threshold=2,
-    )
-
-    failed_result = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 3000,
-        "error": "Simulated connection failure",
-    }
-
-    healthy_result = {
-        "healthy": True,
-        "status_code": 200,
-        "response_time_ms": 100,
-        "error": None,
-    }
+    service = make_service(manager=manager, failure_threshold=2)
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
         side_effect=[
-            failed_result,
-            failed_result,
-            healthy_result,
+            make_result(False),
+            make_result(False),
+            make_result(True, 200),
         ],
     ):
         service.check_once()
@@ -126,36 +116,22 @@ def test_recovery_resolves_existing_incident():
     assert incidents[0]["status"] == "resolved"
     assert incidents[0]["resolved_at"]
 
+
 def test_recovery_is_requested_once_when_incident_is_created():
-    from unittest.mock import Mock
-
     manager = IncidentManager()
-    coordinator = Mock()
-    coordinator.attempt_recovery.return_value = {
-        "service": "demo-service",
-        "attempted": False,
-        "success": False,
-        "message": "Recovery blocked by policy",
-    }
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
-        failure_threshold=2,
-        recovery_coordinator=coordinator,
+    coordinator = make_coordinator(attempted=False, success=False)
+    coordinator.attempt_recovery.return_value["message"] = (
+        "Recovery blocked by policy"
     )
-
-    failed_result = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 3000,
-        "error": "Simulated connection failure",
-    }
+    service = make_service(
+        manager=manager,
+        failure_threshold=2,
+        coordinator=coordinator,
+    )
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        return_value=failed_result,
+        return_value=make_result(False),
     ):
         first = service.check_once()
         second = service.check_once()
@@ -163,55 +139,31 @@ def test_recovery_is_requested_once_when_incident_is_created():
 
     assert first["incident_created"] is False
     assert first["recovery"] is None
-
     assert second["incident_created"] is True
-    assert second["recovery"]["message"] == (
-        "Recovery blocked by policy"
-    )
-
+    assert second["recovery"]["message"] == "Recovery blocked by policy"
     assert third["incident_created"] is False
     assert third["recovery"] is None
 
-    coordinator.attempt_recovery.assert_called_once_with(
-        "demo-service"
-    )
+    coordinator.attempt_recovery.assert_called_once_with("demo-service")
     assert len(manager.list_incidents()) == 1
+
+
 def test_successful_recovery_is_verified_and_resolves_incident():
-    from unittest.mock import Mock
-
     manager = IncidentManager()
-    coordinator = Mock()
-    coordinator.attempt_recovery.return_value = {
-        "service": "demo-service",
-        "attempted": True,
-        "success": True,
-        "message": "Recovery action completed",
-    }
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
+    coordinator = make_coordinator()
+    service = make_service(
+        manager=manager,
         failure_threshold=2,
-        recovery_coordinator=coordinator,
+        coordinator=coordinator,
     )
-
-    failed = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 100,
-        "error": "Simulated failure",
-    }
-    healthy = {
-        "healthy": True,
-        "status_code": 200,
-        "response_time_ms": 50,
-        "error": None,
-    }
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        side_effect=[failed, failed, healthy],
+        side_effect=[
+            make_result(False),
+            make_result(False),
+            make_result(True, 200),
+        ],
     ) as health_check:
         service.check_once()
         result = service.check_once()
@@ -228,40 +180,24 @@ def test_successful_recovery_is_verified_and_resolves_incident():
 
 
 def test_recovery_action_success_does_not_resolve_unhealthy_service():
-    from unittest.mock import Mock
-
     manager = IncidentManager()
-    coordinator = Mock()
-    coordinator.attempt_recovery.return_value = {
-        "service": "demo-service",
-        "attempted": True,
-        "success": True,
-        "message": "Recovery action completed",
-    }
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
+    coordinator = make_coordinator()
+    service = make_service(
+        manager=manager,
         failure_threshold=2,
-        recovery_coordinator=coordinator,
+        coordinator=coordinator,
+        recovery_verification_attempts=5,
     )
-
-    failed = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 100,
-        "error": "Simulated failure",
-    }
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        return_value=failed,
+        return_value=make_result(False),
     ) as health_check:
         service.check_once()
         result = service.check_once()
 
-    assert health_check.call_count == 3
+    # Two regular checks plus five verification attempts.
+    assert health_check.call_count == 7
     assert result["recovery"]["success"] is True
     assert result["recovery_verification"]["healthy"] is False
     assert result["active_incident"] is not None
@@ -270,34 +206,51 @@ def test_recovery_action_success_does_not_resolve_unhealthy_service():
     assert incident["status"] == "open"
     assert "resolved_at" not in incident
 
-def test_health_check_is_recorded_in_history():
-    from app.monitoring.history_store import MonitoringHistoryStore
 
+def test_recovery_verification_retries_until_service_is_healthy():
     manager = IncidentManager()
-    history = MonitoringHistoryStore()
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
-        history_store=history,
+    coordinator = make_coordinator()
+    service = make_service(
+        manager=manager,
+        failure_threshold=2,
+        coordinator=coordinator,
+        recovery_verification_attempts=5,
     )
-
-    healthy = {
-        "healthy": True,
-        "status_code": 200,
-        "response_time_ms": 25,
-        "error": None,
-    }
 
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        return_value=healthy,
+        side_effect=[
+            make_result(False),
+            make_result(False),
+            make_result(False),
+            make_result(False),
+            make_result(True, 200),
+        ],
+    ) as health_check:
+        service.check_once()
+        result = service.check_once()
+
+    assert health_check.call_count == 5
+    assert result["recovery_verification"]["healthy"] is True
+    assert result["active_incident"] is None
+    assert manager.list_incidents()[0]["status"] == "resolved"
+
+
+def test_health_check_is_recorded_in_history():
+    manager = IncidentManager()
+    history = MonitoringHistoryStore()
+    service = make_service(
+        manager=manager,
+        history_store=history,
+    )
+
+    with patch(
+        "app.monitoring.monitor_service.check_http_health",
+        return_value=make_result(True, 200),
     ):
         service.check_once()
 
     records = history.get_history("demo-service")
-
     assert len(records) == 1
     assert records[0]["healthy"] is True
     assert records[0]["status_code"] == 200
@@ -305,50 +258,64 @@ def test_health_check_is_recorded_in_history():
 
 
 def test_recovery_verification_is_also_recorded():
-    from unittest.mock import Mock
-    from app.monitoring.history_store import MonitoringHistoryStore
-
     manager = IncidentManager()
     history = MonitoringHistoryStore()
-
-    coordinator = Mock()
-    coordinator.attempt_recovery.return_value = {
-        "service": "demo-service",
-        "attempted": True,
-        "success": True,
-        "message": "Recovery action completed",
-    }
-
-    service = MonitoredService(
-        name="demo-service",
-        url="http://example.invalid/health",
-        incident_manager=manager,
+    coordinator = make_coordinator()
+    service = make_service(
+        manager=manager,
         failure_threshold=1,
-        recovery_coordinator=coordinator,
+        coordinator=coordinator,
         history_store=history,
     )
 
-    failed = {
-        "healthy": False,
-        "status_code": None,
-        "response_time_ms": 100,
-        "error": "Simulated failure",
-    }
-    healthy = {
-        "healthy": True,
-        "status_code": 200,
-        "response_time_ms": 30,
-        "error": None,
-    }
-
     with patch(
         "app.monitoring.monitor_service.check_http_health",
-        side_effect=[failed, healthy],
+        side_effect=[
+            make_result(False),
+            make_result(True, 200),
+        ],
     ):
         service.check_once()
 
     records = history.get_history("demo-service")
-
     assert len(records) == 2
     assert records[0]["healthy"] is False
     assert records[1]["healthy"] is True
+
+
+def test_recovery_workflow_attempts_action_and_verifies_health():
+    manager = IncidentManager()
+    action = Mock(return_value=True)
+    coordinator = RecoveryCoordinator(
+        RecoveryPolicy(
+            enabled=True,
+            max_attempts=3,
+            cooldown_seconds=60,
+        ),
+        action,
+    )
+    service = make_service(
+        manager=manager,
+        failure_threshold=2,
+        coordinator=coordinator,
+    )
+
+    with patch(
+        "app.monitoring.monitor_service.check_http_health",
+        side_effect=[
+            make_result(False, 503, "Service unavailable"),
+            make_result(False, 503, "Service unavailable"),
+            make_result(True, 200),
+        ],
+    ) as health_check:
+        service.check_once()
+        result = service.check_once()
+
+    action.assert_called_once_with("demo-service")
+    assert health_check.call_count == 3
+    assert result["incident_created"] is True
+    assert result["recovery"]["attempted"] is True
+    assert result["recovery"]["success"] is True
+    assert result["recovery_verification"]["healthy"] is True
+    assert result["active_incident"] is None
+    assert manager.list_incidents()[0]["status"] == "resolved"

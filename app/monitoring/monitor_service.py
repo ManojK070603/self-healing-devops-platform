@@ -1,8 +1,11 @@
+
+import time
+
 from app.monitoring.health_checker import (
     HealthMonitor,
     check_http_health,
 )
-from app.monitoring.history_store import MonitoringHistoryStore
+
 
 class MonitoredService:
     """Connect health checks, incidents, and controlled recovery."""
@@ -16,7 +19,19 @@ class MonitoredService:
         timeout=3,
         recovery_coordinator=None,
         history_store=None,
+        recovery_verification_attempts=5,
+        recovery_verification_interval=1.0,
     ):
+        if recovery_verification_attempts < 1:
+            raise ValueError(
+                "recovery_verification_attempts must be at least 1"
+            )
+
+        if recovery_verification_interval < 0:
+            raise ValueError(
+                "recovery_verification_interval cannot be negative"
+            )
+
         self.name = name
         self.url = url
         self.timeout = timeout
@@ -27,21 +42,49 @@ class MonitoredService:
         self.recovery_coordinator = recovery_coordinator
         self.active_incident = None
         self.history_store = history_store
+        self.recovery_verification_attempts = (
+            recovery_verification_attempts
+        )
+        self.recovery_verification_interval = (
+            recovery_verification_interval
+        )
+
+    def _record_history(self, result):
+        """Save a health result when history storage is configured."""
+        if self.history_store is not None:
+            self.history_store.record({
+                "service": self.name,
+                **result,
+            })
+
+    def _verify_recovery(self):
+        """Retry health checks until healthy or attempts are exhausted."""
+        last_result = None
+
+        for attempt in range(self.recovery_verification_attempts):
+            if attempt > 0:
+                time.sleep(self.recovery_verification_interval)
+
+            last_result = check_http_health(
+                self.url,
+                timeout=self.timeout,
+            )
+            self._record_history(last_result)
+
+            if last_result["healthy"]:
+                return last_result
+
+        return last_result
 
     def check_once(self):
+        """Run one monitoring check and handle incidents and recovery."""
         health_result = check_http_health(
             self.url,
             timeout=self.timeout,
         )
-        if self.history_store is not None:
-            self.history_store.record({
-                "service": self.name,
-                **health_result,
-            })
+        self._record_history(health_result)
 
-        monitor_result = self.monitor.record_result(
-            health_result
-        )
+        monitor_result = self.monitor.record_result(health_result)
 
         incident_created = False
         recovery_result = None
@@ -69,7 +112,6 @@ class MonitoredService:
                     ),
                 )
             )
-
             incident_created = True
 
             if self.recovery_coordinator is not None:
@@ -83,22 +125,16 @@ class MonitoredService:
                     recovery_result.get("attempted")
                     and recovery_result.get("success")
                 ):
-                    recovery_verification = check_http_health(
-                        self.url,
-                        timeout=self.timeout,
-                    )
-
-                    monitor_result = self.monitor.record_result(
-                        recovery_verification
-                    )
-
+                    recovery_verification = self._verify_recovery()
                     health_result = recovery_verification
 
-                    if self.history_store is not None:
-                        self.history_store.record({
-                            "service": self.name,
-                            **recovery_verification,
-                        })
+                    # Verification retries are not separate regular
+                    # monitoring checks. Record only the final healthy
+                    # result to reset the consecutive-failure counter.
+                    if recovery_verification["healthy"]:
+                        monitor_result = self.monitor.record_result(
+                            recovery_verification
+                        )
 
         if (
             health_result["healthy"]
