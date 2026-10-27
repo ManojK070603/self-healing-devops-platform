@@ -244,3 +244,137 @@ def test_runner_health_check_appears_in_metrics_api():
     assert metrics["unhealthy_checks"] == 0
     assert metrics["success_rate_percent"] == 100.0
     assert metrics["average_response_time_ms"] == 18.0
+
+def test_live_dashboard_returns_empty_state_without_checks():
+    client = create_app().test_client()
+
+    response = client.get("/api/dashboard/live")
+
+    assert response.status_code == 200
+    data = response.get_json()
+
+    assert data["demo_data"] is False
+    assert data["services"]["total"] == 0
+    assert data["services"]["healthy"] == 0
+    assert data["services"]["unhealthy"] == 0
+    assert data["services"]["items"] == []
+
+
+def test_live_dashboard_reflects_recorded_health_checks():
+    app = create_app()
+    client = app.test_client()
+    history_store = app.extensions["monitoring_history_store"]
+
+    history_store.record({
+        "service": "demo-api",
+        "healthy": True,
+        "status_code": 200,
+        "response_time_ms": 18.0,
+        "error": None,
+    })
+
+    history_store.record({
+        "service": "worker-api",
+        "healthy": False,
+        "status_code": 503,
+        "response_time_ms": 35.0,
+        "error": "Service unavailable",
+    })
+
+    response = client.get("/api/dashboard/live")
+
+    assert response.status_code == 200
+    data = response.get_json()
+
+    assert data["demo_data"] is False
+    assert data["services"]["total"] == 2
+    assert data["services"]["healthy"] == 1
+    assert data["services"]["unhealthy"] == 1
+
+    statuses = {
+        service["name"]: service["status"]
+        for service in data["services"]["items"]
+    }
+
+    assert statuses["demo-api"] == "healthy"
+    assert statuses["worker-api"] == "unhealthy"
+
+
+def test_monitoring_check_endpoint_returns_real_monitoring_result(monkeypatch):
+    app = create_app()
+    client = app.test_client()
+    runner = app.extensions["monitor_runner"]
+
+    expected_results = [
+        {
+            "service": "platform-api",
+            "health": {
+                "healthy": True,
+                "consecutive_failures": 0,
+                "threshold": 3,
+                "unhealthy": False,
+                "last_result": {
+                    "healthy": True,
+                    "status_code": 200,
+                    "response_time_ms": 12.0,
+                    "error": None,
+                },
+            },
+            "incident_created": False,
+            "active_incident": None,
+            "recovery": None,
+            "recovery_verification": None,
+        }
+    ]
+
+    def fake_run_once():
+        return expected_results
+
+    monkeypatch.setattr(runner, "run_once", fake_run_once)
+
+    response = client.post("/api/monitoring/check")
+
+    assert response.status_code == 200
+
+    data = response.get_json()
+
+    assert data["demo_data"] is False
+    assert data["results"] == expected_results
+
+
+def test_monitoring_check_endpoint_records_health_metrics(monkeypatch):
+    app = create_app()
+    client = app.test_client()
+    runner = app.extensions["monitor_runner"]
+    history_store = app.extensions["monitoring_history_store"]
+
+    def fake_run_once():
+        history_store.record({
+            "service": "platform-api",
+            "healthy": True,
+            "status_code": 200,
+            "response_time_ms": 18.0,
+            "error": None,
+        })
+
+        return [{"service": "platform-api"}]
+
+    monkeypatch.setattr(runner, "run_once", fake_run_once)
+
+    response = client.post("/api/monitoring/check")
+
+    assert response.status_code == 200
+
+    metrics_response = client.get(
+        "/api/monitoring/metrics?service=platform-api"
+    )
+
+    assert metrics_response.status_code == 200
+
+    metrics = metrics_response.get_json()["metrics"]
+
+    assert metrics["total_checks"] == 1
+    assert metrics["healthy_checks"] == 1
+    assert metrics["unhealthy_checks"] == 0
+    assert metrics["success_rate_percent"] == 100.0
+    assert metrics["average_response_time_ms"] == 18.0

@@ -142,3 +142,59 @@ def monitoring_metrics():
         "service": service_name,
         "metrics": metrics_service.get_metrics(service_name),
     }), 200
+
+@main.route("/api/dashboard/live", methods=["GET"])
+def live_dashboard():
+    history_store = current_app.extensions[
+        "monitoring_history_store"
+    ]
+    metrics_service = current_app.extensions[
+        "monitoring_metrics_service"
+    ]
+
+    service_names = history_store.get_service_names()
+    service_statuses = []
+
+    for service_name in service_names:
+        latest = history_store.get_latest(service_name)
+
+        if latest is None:
+            continue
+
+        service_statuses.append({
+            "name": service_name,
+            "status": (
+                "healthy" if latest["healthy"] else "unhealthy"
+            ),
+            "status_code": latest.get("status_code"),
+            "response_time_ms": latest.get("response_time_ms"),
+            "last_checked": latest.get("timestamp"),
+            "error": latest.get("error"),
+        })
+
+    healthy_count = sum(
+        service["status"] == "healthy"
+        for service in service_statuses
+    )
+
+    return jsonify({
+        "platform": "Self-Healing DevOps Platform",
+        "demo_data": False,
+        "services": {
+            "total": len(service_statuses),
+            "healthy": healthy_count,
+            "unhealthy": len(service_statuses) - healthy_count,
+            "items": service_statuses,
+        },
+        "metrics": metrics_service.get_metrics(),
+    }), 200
+
+@main.route("/api/monitoring/check", methods=["POST"])
+def run_monitoring_check():
+    runner = current_app.extensions["monitor_runner"]
+    results = runner.run_once()
+
+    return jsonify({
+        "demo_data": False,
+        "results": results,
+    }), 200
