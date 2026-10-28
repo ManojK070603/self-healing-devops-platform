@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-
+  packages: write
 jobs:
   test-and-scan:
     name: Test, Audit and Build
@@ -54,3 +54,27 @@ jobs:
           vuln-type: os,library
           severity: HIGH,CRITICAL
           skip-files: "**/pip/_vendor/bom.cdx.json"
+
+      - name: Set container image name
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag verified Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker tag self-healing-platform:${{ github.sha }} "$IMAGE_NAME:${{ github.sha }}"
+          docker tag self-healing-platform:${{ github.sha }} "$IMAGE_NAME:latest"
+
+      - name: Push verified Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE_NAME:${{ github.sha }}"
+          docker push "$IMAGE_NAME:latest"
