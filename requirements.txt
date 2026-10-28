@@ -12,5 +12,5 @@ Pygments==2.21.0
 pytest==9.1.1
 Werkzeug==3.1.9
 msgpack==1.2.3
-setuptools==78.1.1
+setuptools==84.1.0
 urllib3==2.8.0
